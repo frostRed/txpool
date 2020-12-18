@@ -110,6 +110,9 @@ pub enum ImportError {
     Other(anyhow::Error),
 }
 
+#[derive(Debug, Error)]
+pub enum RevertError {}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Status {
     pub transactions: usize,
@@ -150,8 +153,8 @@ impl AccountPool {
 #[derive(Default)]
 pub struct Pool {
     block: Option<BlockHeader>,
-    by_hash: HashMap<H256, Arc<RichTransaction>>,
-    by_sender: HashMap<Address, AccountPool>,
+    tx_by_hash: HashMap<H256, Arc<RichTransaction>>,
+    account_pool_by_sender: HashMap<Address, AccountPool>,
 }
 
 impl Pool {
@@ -163,20 +166,20 @@ impl Pool {
     /// Get status of this pool.
     pub fn status(&self) -> Status {
         Status {
-            transactions: self.by_hash.len(),
-            senders: self.by_sender.len(),
+            transactions: self.tx_by_hash.len(),
+            senders: self.account_pool_by_sender.len(),
         }
     }
 
     /// Get transaction by its hash.
     pub fn get(&self, hash: H256) -> Option<&Transaction> {
-        self.by_hash.get(&hash).map(|tx| &tx.inner)
+        self.tx_by_hash.get(&hash).map(|tx| &tx.inner)
     }
 
     fn import_one_rich(&mut self, tx: Arc<RichTransaction>) -> Result<bool, ImportError> {
         self.block.ok_or(ImportError::NoCurrentBlock)?;
 
-        match self.by_hash.entry(tx.hash) {
+        match self.tx_by_hash.entry(tx.hash) {
             Occupied(_) => {
                 // Tx already there.
                 Ok(false)
@@ -184,7 +187,7 @@ impl Pool {
             Vacant(tx_by_hash_entry) => {
                 // This is a new transaction.
                 let account_pool = self
-                    .by_sender
+                    .account_pool_by_sender
                     .get_mut(&tx.sender)
                     .ok_or(ImportError::NoState(tx.sender))?;
 
@@ -211,7 +214,7 @@ impl Pool {
                             }
 
                             tx_by_hash_entry.insert(tx.clone());
-                            assert!(self.by_hash.remove(&pooled_tx.hash).is_some());
+                            assert!(self.tx_by_hash.remove(&pooled_tx.hash).is_some());
                             *pooled_tx = tx;
                         } else {
                             // Not a replacement transaction.
@@ -225,7 +228,7 @@ impl Pool {
                         for tx in account_pool
                             .prune_insufficient_balance(Some((offset as usize, cumulative_balance)))
                         {
-                            assert!(self.by_hash.remove(&tx.hash).is_some());
+                            assert!(self.tx_by_hash.remove(&tx.hash).is_some());
                         }
 
                         Ok(true)
@@ -268,6 +271,7 @@ impl Pool {
                             std::collections::btree_map::Entry::Vacant(entry) => {
                                 entry.insert((idx, tx));
                             }
+                            // Same sender, same nonce, but many txs
                             std::collections::btree_map::Entry::Occupied(mut entry) => {
                                 let (old_idx, old_tx) = entry.get();
 
@@ -326,8 +330,8 @@ impl Pool {
 
     /// Erase all transactions from the pool.
     pub fn erase(&mut self) {
-        self.by_hash.clear();
-        self.by_sender.clear();
+        self.tx_by_hash.clear();
+        self.account_pool_by_sender.clear();
     }
 
     /// Reset transaction pool to this block.
@@ -338,7 +342,7 @@ impl Pool {
 
     /// Add state of the account to this pool.
     pub fn add_account_state(&mut self, address: Address, info: AccountInfo) -> bool {
-        if let Vacant(entry) = self.by_sender.entry(address) {
+        if let Vacant(entry) = self.account_pool_by_sender.entry(address) {
             entry.insert(AccountPool {
                 info,
                 txs: Default::default(),
@@ -352,9 +356,9 @@ impl Pool {
 
     /// Drop account from this pool.
     pub fn drop_account(&mut self, address: Address) -> bool {
-        if let Some(pool) = self.by_sender.remove(&address) {
+        if let Some(pool) = self.account_pool_by_sender.remove(&address) {
             for tx in pool.txs {
-                assert!(self.by_hash.remove(&tx.hash).is_some());
+                assert!(self.tx_by_hash.remove(&tx.hash).is_some());
             }
             return true;
         }
@@ -364,7 +368,9 @@ impl Pool {
 
     /// Get account state in this pool.
     pub fn account_state(&self, address: Address) -> Option<AccountInfo> {
-        self.by_sender.get(&address).map(|pool| pool.info)
+        self.account_pool_by_sender
+            .get(&address)
+            .map(|pool| pool.info)
     }
 
     fn apply_block_inner(
@@ -388,7 +394,7 @@ impl Pool {
 
         for (address, account_diff) in account_diffs {
             // Only do something if we actually have pool for this sender.
-            if let Occupied(mut address_entry) = self.by_sender.entry(address) {
+            if let Occupied(mut address_entry) = self.account_pool_by_sender.entry(address) {
                 match account_diff {
                     AccountDiff::Changed(new_info) => {
                         let pool = address_entry.get_mut();
@@ -399,13 +405,13 @@ impl Pool {
 
                         for _ in 0..nonce_diff {
                             if let Some(tx) = pool.txs.pop_front() {
-                                assert!(self.by_hash.remove(&tx.hash).is_some());
+                                assert!(self.tx_by_hash.remove(&tx.hash).is_some());
                             }
                         }
 
                         // More expensive tx could have squeezed in - we have to recheck our balance.
                         for tx in pool.prune_insufficient_balance(None) {
-                            assert!(self.by_hash.remove(&tx.hash).is_some());
+                            assert!(self.tx_by_hash.remove(&tx.hash).is_some());
                         }
 
                         if pool.txs.is_empty() {
@@ -414,7 +420,7 @@ impl Pool {
                     }
                     AccountDiff::Deleted => {
                         for tx in address_entry.remove().txs {
-                            assert!(self.by_hash.remove(&tx.hash).is_some());
+                            assert!(self.tx_by_hash.remove(&tx.hash).is_some());
                         }
                     }
                 }
@@ -442,10 +448,90 @@ impl Pool {
         self.block = Some(block);
     }
 
+    fn revert_one_rich(
+        &mut self,
+        tx: RichTransaction,
+        account_info: &AccountInfo,
+    ) -> anyhow::Result<bool> {
+        self.block.ok_or(ImportError::NoCurrentBlock)?;
+
+        match self.tx_by_hash.entry(tx.hash) {
+            Occupied(_) => {
+                // Tx already there.
+                bail!("revert a tx still in pool {}", tx.hash);
+            }
+            Vacant(tx_by_hash_entry) => {
+                // This is a new transaction.
+                let account_pool = match self
+                    .account_pool_by_sender
+                    .entry(tx.sender) {
+                    Occupied(mut pool) => pool.get_mut(),
+                    Vacant(pool) => {
+                        let new_account_pool = AccountPool {
+                            txs: VecDeque::new(),
+                            info: account_info.clone(),
+                        };
+                        pool.insert(new_account_pool)
+                    }
+                };
+
+                if let Some(offset) = tx.inner.nonce.as_u64().checked_sub(account_pool.info.nonce) {
+                    // This transaction's nonce is account nonce or greater.
+                    if offset <= account_pool.txs.len() as u64 {
+                        // This transaction is between existing txs in the pool, or right the next one.
+
+                        // Compute balance after executing all txs before it.
+                        let cumulative_balance = account_pool
+                            .txs
+                            .iter()
+                            .take(offset as usize)
+                            .fold(account_pool.info.balance, |balance, tx| balance - tx.cost());
+
+                        if cumulative_balance.checked_sub(tx.cost()).is_none() {
+                            return Err(ImportError::InsufficientBalance);
+                        }
+
+                        // If this is a replacement transaction, pick between this and old.
+                        if let Some(pooled_tx) = account_pool.txs.get_mut(offset as usize) {
+                            if pooled_tx.inner.gas_price >= tx.inner.gas_price {
+                                return Err(ImportError::FeeTooLow);
+                            }
+
+                            tx_by_hash_entry.insert(tx.clone());
+                            assert!(self.tx_by_hash.remove(&pooled_tx.hash).is_some());
+                            *pooled_tx = tx;
+                        } else {
+                            // Not a replacement transaction.
+                            assert_eq!(tx.inner.nonce, U256::from(account_pool.txs.len()));
+
+                            tx_by_hash_entry.insert(tx.clone());
+                            account_pool.txs.push_back(tx);
+                        }
+
+                        // Compute the balance after executing remaining transactions. Select for removal those for which we do not have enough balance.
+                        for tx in account_pool
+                            .prune_insufficient_balance(Some((offset as usize, cumulative_balance)))
+                        {
+                            assert!(self.tx_by_hash.remove(&tx.hash).is_some());
+                        }
+
+                        Ok(true)
+                    } else {
+                        Err(ImportError::NonceGap)
+                    }
+                } else {
+                    // Nonce lower than account, meaning it's stale.
+                    Err(ImportError::StaleTransaction)
+                }
+            }
+        }
+    }
+
     fn revert_block_inner(
         &mut self,
         block: BlockHeader,
-        _reverted_txs: Vec<Transaction>,
+        reverted_txs: Vec<Transaction>,
+        account_diffs: HashMap<Address, AccountDiff>,
     ) -> anyhow::Result<()> {
         let current_block = if let Some(b) = self.block {
             b
@@ -461,13 +547,26 @@ impl Pool {
             );
         }
 
-        Err(anyhow!("not implemented"))
+        for tx in reverted_txs {
+            let tx = RichTransaction::try_from(tx)?;
+            let account_diff = account_diffs
+                .get(&tx.sender)
+                .or_else(anyhow!("reverted tx lack account info"))?;
+            self.revert_one_rich(tx, account_diff)?;
+        }
+
+        Ok(())
     }
 
     /// Revert state updates from block that has become non-canonical, restore its transactions to the pool.
     /// This should be called by the client when it encounters a reorg.
-    pub fn revert_block(&mut self, block: BlockHeader, reverted_txs: Vec<Transaction>) {
-        if let Err(e) = self.revert_block_inner(block, reverted_txs) {
+    pub fn revert_block(
+        &mut self,
+        block: BlockHeader,
+        reverted_txs: Vec<Transaction>,
+        account_diffs: HashMap<Address, AccountDiff>,
+    ) {
+        if let Err(e) = self.revert_block_inner(block, reverted_txs, account_diffs) {
             warn!(
                 "Failed to revert block {}: {}. Resetting transaction pool.",
                 block.hash, e
@@ -480,7 +579,7 @@ impl Pool {
 
     /// Produce an iterator over all pending transactions in random order.
     pub fn pending_transactions(&self) -> impl Iterator<Item = &Transaction> {
-        self.by_hash.values().map(|tx| &tx.inner)
+        self.tx_by_hash.values().map(|tx| &tx.inner)
     }
 
     /// Produce an iterator for pending transactions from `sender`, sorted by nonce in ascending order.
@@ -488,7 +587,7 @@ impl Pool {
         &self,
         sender: Address,
     ) -> Option<impl Iterator<Item = &Transaction>> {
-        self.by_sender
+        self.account_pool_by_sender
             .get(&sender)
             .map(|pool| pool.txs.iter().map(|tx| &tx.inner))
     }
